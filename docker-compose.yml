@@ -1,0 +1,234 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: sh -c "pnpm --filter @repo/schemas build && pnpm turbo run dev --filter=api"
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./apps/api:/app/apps/api # only api source
+      - ./packages:/app/packages
+      - /app/node_modules # protect root node_modules
+      - /app/apps/api/node_modules # protect api node_modules
+      - /app/packages/core/node_modules
+      - /app/packages/db/node_modules
+      - /app/packages/schemas/node_modules
+      - /app/packages/typescript-config/node_modules
+    environment:
+      - NODE_ENV=development
+      - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET is required}
+      - API_URL=${API_URL:-localhost:8787}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:?INTERNAL_API_SECRET is required}
+      - R2_ENDPOINT=${R2_ENDPOINT:-http://minio:9000}
+      - R2_BUCKET=${R2_BUCKET:-worker-data}
+      - R2_ACCESS_KEY_ID=${MINIO_ROOT_USER:-minioadmin}
+      - R2_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - R2_REGION=${R2_REGION:-us-east-1}
+      - R2_PUBLIC_URL=${R2_PUBLIC_URL:-http://localhost:9000}
+      - DOCS_PASSWORD=${DOCS_PASSWORD:-change-this-in-staging}
+      - PII_ENCRYPTION_KEY=${PII_ENCRYPTION_KEY:?PII_ENCRYPTION_KEY is required}
+      - SMTP_HOST=${SMTP_HOST:-maildev}
+      - SMTP_PORT=${SMTP_PORT:-1025}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - EMAIL_FROM=${EMAIL_FROM:-noreply@racketph.com}
+      - ORS_API_KEY=${ORS_API_KEY:?ORS_API_KEY is required}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+
+    networks:
+      - turborepo-network
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'node -e "fetch(''http://localhost:8787/v1/health/ping'',{method:''POST'',headers:{''Content-Type'':''application/json''},body:''{}''}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"',
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      maildev:
+        condition: service_started
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    command: pnpm turbo run dev --filter=web
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./apps/web:/app/apps/web # only web source
+      - ./packages:/app/packages
+      - /app/node_modules # protect root node_modules
+      - /app/apps/web/node_modules # protect web node_modules
+      - /app/packages/core/node_modules
+      - /app/packages/ui/node_modules # web likely needs ui
+      - /app/packages/schemas/node_modules
+      - /app/packages/typescript-config/node_modules
+    networks:
+      - turborepo-network
+    environment:
+      - NODE_ENV=development
+      - VITE_API_URL=${VITE_API_URL:-http://localhost:8787}
+      - VITE_CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:8787,http://localhost:3000}
+      # server-only: SSR loaders run inside this container and must reach the
+      # api container by its Docker service name, not the host-published port
+      - API_INTERNAL_URL=${API_INTERNAL_URL:-http://api:8787}
+      - VITE_GTM_ID=${VITE_GTM_ID:-GTM-XXXXXXX}
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:3000/health > /dev/null 2>&1 || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      - api
+
+  postgres:
+    #container_name: postgres
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=turborepodb
+      - POSTGRES_USER=turborepouser
+      - POSTGRES_PASSWORD=turborepopass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - turborepo-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U turborepouser -d turborepodb"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Redis Cache and Message Broker
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - turborepo-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  redisinsight:
+    image: redis/redisinsight:latest
+    restart: unless-stopped
+    ports:
+      - "5540:5540"
+    volumes:
+      - redisinsight_data:/data
+    networks:
+      - turborepo-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:5540/api/health"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 3
+    #   start_period: 30s
+
+  minio:
+    image: rustfs/rustfs:latest
+    environment:
+      - RUSTFS_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - RUSTFS_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_VOLUMES=/data
+      - RUSTFS_OBS_LOGGER_LEVEL=info
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - turborepo-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  maildev:
+    image: maildev/maildev:latest
+    restart: unless-stopped
+    ports:
+      - "1080:1080" # web UI
+      - "1025:1025" # SMTP
+    networks:
+      - turborepo-network
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://127.0.0.1:1080/api/healthz > /dev/null 2>&1 || exit 1",
+        ]
+      # If auth is enabled, include basic auth in the wget command:
+      # test: ["CMD", "wget", "--http-user=maildev", "--http-password=maildev", "-qO-", "http://127.0.0.1:1080/api/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  minio-init:
+    image: rustfs/rustfs:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - turborepo-network
+    environment:
+      - RUSTFS_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - RUSTFS_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - R2_BUCKET=${R2_BUCKET:-worker-data}
+    entrypoint: >
+      /bin/sh -c "
+        set -e;
+        rc alias set local http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD;
+        rc mb --ignore-existing local/$R2_BUCKET;
+        printf '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::$R2_BUCKET/avatars/*\"]}]}' > /tmp/p.json;
+        rc anonymous set-json /tmp/p.json local/$R2_BUCKET;
+        exit 0;
+      "
+
+volumes:
+  redis_data:
+  postgres_data:
+  redisinsight_data:
+  minio_data:
+
+networks:
+  turborepo-network:
+    name: turborepo-network
+    driver: bridge
